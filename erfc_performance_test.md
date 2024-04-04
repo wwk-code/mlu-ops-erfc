@@ -1,5 +1,7 @@
-一、Pytorch.erfc性能测试:
-float类型数据:
+## 一、Pytorch.erfc性能测试:
+
+#### float类型数据:
+
 [10240] torch.Size([10240])
 [pytorch-digamma-py] time: 0.013816595077514648 ms
 [102400] torch.Size([102400])
@@ -8,7 +10,8 @@ float类型数据:
 [pytorch-digamma-py] time: 0.021748065948486328 ms
 [10240] torch.Size([10240])
 [pytorch-digamma-py] time: 0.012364625930786133 ms
-half
+
+##### half类型数据:
 [10240] torch.Size([10240])
 [pytorch-digamma-py] time: 0.013695955276489258 ms
 [102400] torch.Size([102400])
@@ -19,8 +22,10 @@ half
 [pytorch-digamma-py] time: 0.012649774551391602 ms
 
 
-二、Cambricon.erfc性能测试:
-float类型数据:
+## 二、Cambricon.erfc性能测试:
+
+#### float类型数据:
+
 [10240] cambricon.erfc.Size([10240])
 [cambricon-erfc-wdhs] time: 0.035 ms
 [102400] cambricon.erfc.Size([102400])
@@ -28,7 +33,8 @@ float类型数据:
 [1024000] cambricon.erfc.Size([1024000])
 [cambricon-erfc-wdhs] time: 0.052 ms
 
-half类型数据
+#### half类型数据
+
 [10240] cambricon.erfc.Size([10240])
 [cambricon-erfc-wdhs] time: 0.039 ms
 [102400] cambricon.erfc.Size([102400])
