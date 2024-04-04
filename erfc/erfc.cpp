@@ -88,7 +88,7 @@ mluOpStatus_t MLUOP_WIN_API mluOpErfc(mluOpHandle_t handle,
   printf("dim.y:%d \n",k_dim.y);
   printf("dim.z:%d \n",k_dim.z);
 
-  // 修改 k_type 试一试
+
   int len_kdimX = 4;
   k_dim.x = len_kdimX;
   if(element_num <= len_kdimX * WORKLOAD) k_dim.y = 2;
