@@ -1,0 +1,646 @@
+/*************************************************************************
+ * Copyright (C) [2022] by Cambricon, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *************************************************************************/
+#include "erfc.h"
+
+#include <bang.h>
+#include <sys/time.h>
+
+#include <math.h>
+#include "core/logging.h"
+#include "kernels/debug.h"
+#include "kernels/kernel.h"
+#include "kernels/unary_op/unary_op_3pipeline.h"
+#include "kernels/unary_op/unary_op_5pipeline.h"
+
+#define EPS 1e-7
+
+#define erx_f 8.4506291151e-01f /* 0x3f58560b */
+
+#define lessBranchAssign(resultArr, firstCondArr, condValue, firstAssignArr, secondAssignArr) \
+    do                                                                                        \
+    {                                                                                         \
+        __bang_lt_scalar(compareArr, firstCondArr, (condValue), BATCH_SZ);                    \
+        __bang_not(notcompareArr, compareArr, BATCH_SZ);                                      \
+        __bang_mul(leftCondArr, compareArr, firstAssignArr, BATCH_SZ);                        \
+        __bang_mul(rightCondArr, notcompareArr, secondAssignArr, BATCH_SZ);                   \
+        __bang_write_zero(resultArr, BATCH_SZ);                                               \
+        __bang_add(resultArr, resultArr, leftCondArr, BATCH_SZ);                              \
+        __bang_add(resultArr, resultArr, rightCondArr, BATCH_SZ);                             \
+    } while (0)
+
+#define mad(a, b, c) ((a) * (b) + (c))
+
+#define mad0(A, b, c, resultArr)                                     \
+    do                                                               \
+    {                                                                \
+        if (sizeof(T) == sizeof(float))                              \
+            __memcpy(tempA, A, BATCH_SZ * sizeof(float), NRAM2NRAM); \
+        else                                                         \
+            __memcpy(tempA, A, BATCH_SZ * sizeof(half), NRAM2NRAM);  \
+        __bang_mul_scalar(tempA, tempA, (b), BATCH_SZ);              \
+        __bang_add_scalar(resultArr, tempA, (c), BATCH_SZ);          \
+    } while (0)
+
+#define mad1(A, A_1, c, resultArr)                          \
+    do                                                      \
+    {                                                       \
+        __bang_mul(tempA, A, A_1, BATCH_SZ);                \
+        __bang_add_scalar(resultArr, tempA, (c), BATCH_SZ); \
+    } while (0)
+
+#define mad2(A, A_1, A_2, resultArr)                 \
+    do                                               \
+    {                                                \
+        __bang_mul(tempD, A, A_1, BATCH_SZ);         \
+        __bang_add(resultArr, tempD, A_2, BATCH_SZ); \
+    } while (0)
+
+#define isNanBranchAssign(resultArr, condArr, firstAssignArr, secondAssignArr) \
+    do                                                                         \
+    {                                                                          \
+        __bang_not(notcompareArr, condArr, BATCH_SZ);                          \
+        __bang_mul(leftCondArr, condArr, firstAssignArr, BATCH_SZ);            \
+        __bang_mul(rightCondArr, notcompareArr, secondAssignArr, BATCH_SZ);    \
+        __bang_write_zero(resultArr, BATCH_SZ);                                \
+        __bang_add(resultArr, resultArr, leftCondArr, BATCH_SZ);               \
+        __bang_add(resultArr, resultArr, rightCondArr, BATCH_SZ);              \
+    } while (0)
+
+#define setVecValue(vector, value)                   \
+    do                                               \
+    {                                                \
+        __bang_write_value(vector, BATCH_SZ, value); \
+    } while (0)
+
+// Coefficients for approximation to  erf on [00.84375]
+
+#define efx 1.2837916613e-01f  /* 0x3e0375d4 */
+#define efx8 1.0270333290e+00f /* 0x3f8375d4 */
+
+#define pp0 1.2837916613e-01f  /* 0x3e0375d4 */
+#define pp1 -3.2504209876e-01f /* 0xbea66beb */
+#define pp2 -2.8481749818e-02f /* 0xbce9528f */
+#define pp3 -5.7702702470e-03f /* 0xbbbd1489 */
+#define pp4 -2.3763017452e-05f /* 0xb7c756b1 */
+#define qq1 3.9791721106e-01f  /* 0x3ecbbbce */
+#define qq2 6.5022252500e-02f  /* 0x3d852a63 */
+#define qq3 5.0813062117e-03f  /* 0x3ba68116 */
+#define qq4 1.3249473704e-04f  /* 0x390aee49 */
+#define qq5 -3.9602282413e-06f /* 0xb684e21a */
+
+// Coefficients for approximation to  erf  in [0.843751.25]
+
+#define pa0 -2.3621185683e-03f /* 0xbb1acdc6 */
+#define pa1 4.1485610604e-01f  /* 0x3ed46805 */
+#define pa2 -3.7220788002e-01f /* 0xbebe9208 */
+#define pa3 3.1834661961e-01f  /* 0x3ea2fe54 */
+#define pa4 -1.1089469492e-01f /* 0xbde31cc2 */
+#define pa5 3.5478305072e-02f  /* 0x3d1151b3 */
+#define pa6 -2.1663755178e-03f /* 0xbb0df9c0 */
+#define qa1 1.0642088205e-01f  /* 0x3dd9f331 */
+#define qa2 5.4039794207e-01f  /* 0x3f0a5785 */
+#define qa3 7.1828655899e-02f  /* 0x3d931ae7 */
+#define qa4 1.2617121637e-01f  /* 0x3e013307 */
+#define qa5 1.3637083583e-02f  /* 0x3c5f6e13 */
+#define qa6 1.1984500103e-02f  /* 0x3c445aa3 */
+
+// Coefficients for approximation to  erfc in [1.251/0.35]
+
+#define ra0 -9.8649440333e-03f /* 0xbc21a093 */
+#define ra1 -6.9385856390e-01f /* 0xbf31a0b7 */
+#define ra2 -1.0558626175e+01f /* 0xc128f022 */
+#define ra3 -6.2375331879e+01f /* 0xc2798057 */
+#define ra4 -1.6239666748e+02f /* 0xc322658c */
+#define ra5 -1.8460508728e+02f /* 0xc3389ae7 */
+#define ra6 -8.1287437439e+01f /* 0xc2a2932b */
+#define ra7 -9.8143291473e+00f /* 0xc11d077e */
+#define sa1 1.9651271820e+01f  /* 0x419d35ce */
+#define sa2 1.3765776062e+02f  /* 0x4309a863 */
+#define sa3 4.3456588745e+02f  /* 0x43d9486f */
+#define sa4 6.4538726807e+02f  /* 0x442158c9 */
+#define sa5 4.2900814819e+02f  /* 0x43d6810b */
+#define sa6 1.0863500214e+02f  /* 0x42d9451f */
+#define sa7 6.5702495575e+00f  /* 0x40d23f7c */
+#define sa8 -6.0424413532e-02f /* 0xbd777f97 */
+
+// Coefficients for approximation to  erfc in [1/.3528]
+
+#define rb0 -9.8649431020e-03f /* 0xbc21a092 */
+#define rb1 -7.9928326607e-01f /* 0xbf4c9dd4 */
+#define rb2 -1.7757955551e+01f /* 0xc18e104b */
+#define rb3 -1.6063638306e+02f /* 0xc320a2ea */
+#define rb4 -6.3756646729e+02f /* 0xc41f6441 */
+#define rb5 -1.0250950928e+03f /* 0xc480230b */
+#define rb6 -4.8351919556e+02f /* 0xc3f1c275 */
+#define sb1 3.0338060379e+01f  /* 0x41f2b459 */
+#define sb2 3.2579251099e+02f  /* 0x43a2e571 */
+#define sb3 1.5367296143e+03f  /* 0x44c01759 */
+#define sb4 3.1998581543e+03f  /* 0x4547fdbb */
+#define sb5 2.5530502930e+03f  /* 0x451f90ce */
+#define sb6 4.7452853394e+02f  /* 0x43ed43a7 */
+#define sb7 -2.2440952301e+01f /* 0xc1b38712 */
+
+#define MATH_DIVIDE(X, Y) ((X) / (Y))
+#define MATH_DIVIDE1(X, Y, Z)                      \
+    do                                             \
+    {                                              \
+        __bang_active_reciphp(tempA, Y, BATCH_SZ); \
+        __bang_mul(Z, X, tempA, BATCH_SZ);         \
+    } while (0)
+
+// xA 大小为 WORKLOAD， 其它大部分辅助数组大小为 BATCHSIZE
+template <typename T>
+__mlu_func__ void llvm_erfc(T *xA)
+{
+    __nram__ T tAu[BATCH_SZ], tAv[BATCH_SZ], Au[BATCH_SZ], Av[BATCH_SZ];
+    __nram__ T qA[BATCH_SZ], retA[BATCH_SZ], zA[BATCH_SZ], rA[BATCH_SZ];
+    __nram__ T tempA[BATCH_SZ], tempB[BATCH_SZ], tempC[BATCH_SZ], tempD[BATCH_SZ]; // SIMD辅助数组
+    __nram__ T tempScalar1;
+    __nram__ int hAx[BATCH_SZ], iAx[BATCH_SZ];
+
+    __nram__ T absAx[BATCH_SZ];
+    __nram__ T xA2[BATCH_SZ];
+    __nram__ T tA[BATCH_SZ];
+    __nram__ T ttA[BATCH_SZ];
+    __nram__ T compareArr[BATCH_SZ], notcompareArr[BATCH_SZ];
+    __nram__ T leftCondArr[BATCH_SZ], rightCondArr[BATCH_SZ];
+
+    for (int step = 0; step * BATCH_SZ < WORKLOAD; step++)
+    {
+        // 这两条打印语句必须运行，否则下述 __memcpy() 的IO流执行会出现问题导致数据传输失败
+        if (taskId == 0 && step == 0)
+            __bang_printf("xA: %f\n", xA[0]);
+
+        __memcpy(hAx, xA + step * BATCH_SZ, BATCH_SZ * sizeof(float), GDRAM2NRAM);
+
+        // 这两条打印语句必须运行，否则下述 __memcpy() 的IO流执行会出现问题导致数据传输失败
+        if (taskId == 0 && step == 0)
+            __bang_printf("hAx: %f\n", hAx[0]);
+
+        __bang_band_scalar(iAx, hAx, 0x7fffffff, BATCH_SZ);
+
+        __memcpy(absAx, iAx, BATCH_SZ * sizeof(int), NRAM2NRAM);
+
+        // SIMD
+        __bang_square(xA2, absAx, BATCH_SZ);
+
+        // SIMD
+        // __bang_active_reciphp(tA, xA2, BATCH_SZ);
+        __bang_active_reciphp(tA, absAx, BATCH_SZ);
+        __bang_square(tA, tA, BATCH_SZ);
+
+        // SIMD
+        __bang_sub_scalar(ttA, absAx, 1.0, BATCH_SZ);
+
+        // SIMD Branch statement
+        // tA[i] = absAx[i] < 1.25f ? ttA[i] : tA[i];
+        lessBranchAssign(tA, absAx, 1.25f, ttA, tA);
+        lessBranchAssign(tA, absAx, 0.84375f, xA2, tA);
+
+        // 开始实现最后的大block
+        __bang_write_zero(retA, BATCH_SZ);
+
+        // Au = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, rb6, rb5), rb4), rb3), rb2), rb1), rb0);
+        mad0(tA, rb6, rb5, tempA);
+        mad1(tA, tempA, rb4, tempA);
+        mad1(tA, tempA, rb3, tempA);
+        mad1(tA, tempA, rb2, tempA);
+        mad1(tA, tempA, rb1, tempA);
+        mad1(tA, tempA, rb0, Au);
+        // __bang_fusion Instruction  (优化效果不好)
+        // __bang_write_value(tempB,BATCH_SZ,rb6);
+        // __bang_write_value(tempC,BATCH_SZ,rb5);
+        // __bang_fusion(FUSION_FMA,tempA,tA,tempB,tempC,BATCH_SZ,BATCH_SZ);
+        // __bang_write_value(tempC,BATCH_SZ,rb4);
+        // __bang_fusion(FUSION_FMA,tempA,tA,tempA,tempC,BATCH_SZ,BATCH_SZ);
+        // __bang_write_value(tempC,BATCH_SZ,rb3);
+        // __bang_fusion(FUSION_FMA,tempA,tA,tempA,tempC,BATCH_SZ,BATCH_SZ);
+        // __bang_write_value(tempC,BATCH_SZ,rb2);
+        // __bang_fusion(FUSION_FMA,tempA,tA,tempA,tempC,BATCH_SZ,BATCH_SZ);
+        // __bang_write_value(tempC,BATCH_SZ,rb1);
+        // __bang_fusion(FUSION_FMA,tempA,tA,tempA,tempC,BATCH_SZ,BATCH_SZ);
+        // __bang_write_value(tempC,BATCH_SZ,rb0);
+        // __bang_fusion(FUSION_FMA,Au,tA,tempA,tempC,BATCH_SZ,BATCH_SZ);
+
+
+        // Av = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, sb7, sb6), sb5), sb4), sb3), sb2), sb1);
+        mad0(tA, sb7, sb6, tempA);
+        mad1(tA, tempA, sb5, tempA);
+        mad1(tA, tempA, sb4, tempA);
+        mad1(tA, tempA, sb3, tempA);
+        mad1(tA, tempA, sb2, tempA);
+        mad1(tA, tempA, sb1, Av);
+
+        // tAu = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, ra7, ra6), ra5), ra4), ra3), ra2), ra1), ra0);
+        mad0(tA, ra7, ra6, tempA);
+        mad1(tA, tempA, ra5, tempA);
+        mad1(tA, tempA, ra4, tempA);
+        mad1(tA, tempA, ra3, tempA);
+        mad1(tA, tempA, ra2, tempA);
+        mad1(tA, tempA, ra1, tempA);
+        mad1(tA, tempA, ra0, tAu);
+
+        // tAv[i] = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, sa8, sa7), sa6), sa5), sa4), sa3), sa2), sa1);
+        mad0(tA, sa8, sa7, tempA);
+        mad1(tA, tempA, sa6, tempA);
+        mad1(tA, tempA, sa5, tempA);
+        mad1(tA, tempA, sa4, tempA);
+        mad1(tA, tempA, sa3, tempA);
+        mad1(tA, tempA, sa2, tempA);
+        mad1(tA, tempA, sa1, tAv);
+
+        // Au[i] = absAx[i] < 0x1.6db6dap+1f ? tAu[i] : Au[i];    // double
+        lessBranchAssign(Au, absAx, 0x1.6db6dap+1f, tAu, Au);
+
+        //     Av[i] = absAx[i] < 0x1.6db6dap+1f ? tAv[i] : Av[i];
+        lessBranchAssign(Av, absAx, 0x1.6db6dap+1f, tAv, Av);
+
+        // tAu[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], pa6, pa5), pa4), pa3), pa2), pa1), pa0);
+        mad0(tA, pa6, pa5, tempA);
+        mad1(tA, tempA, pa4, tempA);
+        mad1(tA, tempA, pa3, tempA);
+        mad1(tA, tempA, pa2, tempA);
+        mad1(tA, tempA, pa1, tempA);
+        mad1(tA, tempA, pa0, tAu);
+
+        // tAv[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], qa6, qa5), qa4), qa3), qa2), qa1);
+        mad0(tA, qa6, qa5, tempA);
+        mad1(tA, tempA, qa4, tempA);
+        mad1(tA, tempA, qa3, tempA);
+        mad1(tA, tempA, qa2, tempA);
+        mad1(tA, tempA, qa1, tAv);
+
+        //     Au[i] = absAx[i] < 0.84375f ? tAu[i] : Au[i];
+        lessBranchAssign(Au, absAx, 1.25f, tAu, Au);
+
+        //     Av[i] = absAx[i] < 0.84375f ? tAv[i] : Av[i];
+        lessBranchAssign(Av, absAx, 1.25f, tAv, Av);
+
+        // tAu[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], pp4, pp3), pp2), pp1), pp0);
+        mad0(tA, pp4, pp3, tempA);
+        mad1(tA, tempA, pp2, tempA);
+        mad1(tA, tempA, pp1, tempA);
+        mad1(tA, tempA, pp0, tAu);
+
+        // tAv[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], qq5, qq4), qq3), qq2), qq1);
+
+        mad0(tA, qq5, qq4, tempA);
+        mad1(tA, tempA, qq3, tempA);
+        mad1(tA, tempA, qq2, tempA);
+        mad1(tA, tempA, qq1, tAv);
+        // Au[i] = absAx[i] < 0.84375f ? tAu[i] : Au[i];
+        lessBranchAssign(Au, absAx, 0.84375f, tAu, Au);
+        // Av[i] = absAx[i] < 0.84375f ? tAv[i] : Av[i];
+        lessBranchAssign(Av, absAx, 0.84375f, tAv, Av);
+
+        // Av[i] = mad(tA[i], Av[i], 1.0f);
+        mad1(tA, Av, 1.0f, Av);
+
+        // qA[i] = MATH_DIVIDE(Au[i],Av[i]);
+        MATH_DIVIDE1(Au, Av, qA);
+
+        // for (i = 0; i < BATCH_SZ; i++)
+        //   zA[i] = as_float(iAx[i] & 0xfffff000);
+        __bang_band_scalar(hAx, iAx, 0xfffff000, BATCH_SZ);
+
+        __memcpy(zA, hAx, BATCH_SZ * sizeof(int), NRAM2NRAM);
+
+        // rA[i] = exp(mad(-zA[i], zA[i], -0.5625f)) * exp(mad(zA[i] - absAx[i], zA[i] + absAx[i], qA[i]));
+        __bang_mul_scalar(tempA, zA, -1.0f, BATCH_SZ);
+        mad1(tempA, zA, -0.5625f, tempA);
+        __bang_active_exphp(tempA, tempA, BATCH_SZ);
+        __bang_sub(tempB, zA, absAx, BATCH_SZ);
+        __bang_add(tempC, zA, absAx, BATCH_SZ);
+        mad2(tempB, tempC, qA, tempD);
+        __bang_active_exphp(tempD, tempD, BATCH_SZ);
+        __bang_mul(rA, tempA, tempD, BATCH_SZ);
+
+        //     rA[i] =  MATH_DIVIDE(rA[i], absAx[i]);
+        MATH_DIVIDE1(rA, absAx, rA);
+
+        //     tA[i] = 2.0f - rA[i];
+        __bang_sub_scalar(tempA, rA, 2.0f, BATCH_SZ);
+        __bang_mul_scalar(tA, tempA, -1.0, BATCH_SZ);
+
+        // r = x < 0.0f ? t : r;
+        lessBranchAssign(rA, xA + step * BATCH_SZ, 0.0f, tA, rA);
+
+        //     retA[i] = absAx[i] < 28.0f ? rA[i] : retA[i];
+        lessBranchAssign(retA, absAx, 28.0f, rA, retA);
+
+        //     rA[i] = 1.0f - erx_f - qA[i];
+        tempScalar1 = 1.0f - erx_f;
+        __bang_sub_scalar(tempA, qA, tempScalar1, BATCH_SZ);
+        __bang_mul_scalar(rA, tempA, -1.0, BATCH_SZ);
+
+        //     tA[i] = erx_f + qA[i] + 1.0f;
+        tempScalar1 = 1.0f + erx_f;
+        __bang_add_scalar(tA, qA, tempScalar1, BATCH_SZ);
+
+        lessBranchAssign(rA, xA + step * BATCH_SZ, 0.00f, tA, rA);
+
+        //     retA[i] = absAx[i] < 1.25f ? rA[i] : retA[i];
+        lessBranchAssign(retA, absAx, 1.25f, rA, retA);
+
+        // rA[i] = 0.5f - mad(xA[i],qA[i],xA[i]-0.5f);
+        __bang_sub_scalar(tempA, xA + step * BATCH_SZ, 0.5f, BATCH_SZ);
+        mad2(xA + step * BATCH_SZ, qA, tempA, tempB);
+        __bang_sub_scalar(tempA, tempB, 0.5f, BATCH_SZ);
+        __bang_mul_scalar(rA, tempA, -1.0, BATCH_SZ);
+
+        //     retA[i] = absAx[i] < 0.84375f ? rA[i] : retA[i];
+        lessBranchAssign(retA, absAx, 0.84375f, rA, retA);
+
+        //     retA[i] = xA[i] < -6.0f ? 2.0f : retA[i];
+        // setVecValue(tempA,2.0f);
+        setVecValue(tempA, 2.0f);
+        lessBranchAssign(retA, xA + step * BATCH_SZ, -6.0f, tempA, retA);
+
+        __bang_move(xA + step * BATCH_SZ, retA, sizeof(T) * BATCH_SZ);
+    }
+}
+
+
+// xA 大小为 WORKLOAD， 其它大部分辅助数组大小为 BATCHSIZE
+template <typename T>
+__mlu_func__ void llvm_erfc_half(T *xA)
+{
+    __nram__ T tAu[BATCH_SZ], tAv[BATCH_SZ], Au[BATCH_SZ], Av[BATCH_SZ];
+    __nram__ T qA[BATCH_SZ], retA[BATCH_SZ], zA[BATCH_SZ], rA[BATCH_SZ];
+    __nram__ T tempA[BATCH_SZ], tempB[BATCH_SZ], tempC[BATCH_SZ], tempD[BATCH_SZ]; // SIMD辅助数组
+    __nram__ T tempScalar1;
+    __nram__ int16_t hAx[BATCH_SZ], iAx[BATCH_SZ];
+
+    __nram__ T absAx[BATCH_SZ];
+    __nram__ T xA2[BATCH_SZ];
+    __nram__ T tA[BATCH_SZ];
+    __nram__ T ttA[BATCH_SZ];
+    __nram__ T compareArr[BATCH_SZ], notcompareArr[BATCH_SZ];
+    __nram__ T leftCondArr[BATCH_SZ], rightCondArr[BATCH_SZ];
+
+    for (int step = 0; step * BATCH_SZ < WORKLOAD; step++)
+    {
+        // 这两条打印语句必须运行，否则下述 __memcpy() 的IO流执行会出现问题导致数据传输失败
+        if (taskId == 0 && step == 0)
+            __bang_printf("xA: %f\n", xA[0]);
+
+        __memcpy(hAx, xA + step * BATCH_SZ, BATCH_SZ * sizeof(T), GDRAM2NRAM);
+
+        // 这两条打印语句必须运行，否则下述 __memcpy() 的IO流执行会出现问题导致数据传输失败
+        if (taskId == 0 && step == 0)
+            __bang_printf("hAx: %f\n", hAx[0]);
+
+        __bang_band_scalar(iAx, hAx, 0x7fff, BATCH_SZ);
+
+        __memcpy(absAx, iAx, BATCH_SZ * sizeof(int16_t), NRAM2NRAM);
+
+        // SIMD
+        __bang_square(xA2, absAx, BATCH_SZ);
+
+        // SIMD
+        // __bang_active_reciphp(tA, xA2, BATCH_SZ);
+        __bang_active_reciphp(tA, absAx, BATCH_SZ);
+        __bang_square(tA, tA, BATCH_SZ);
+
+        // SIMD
+        __bang_sub_scalar(ttA, absAx, 1.0, BATCH_SZ);
+
+        // SIMD Branch statement
+        // tA[i] = absAx[i] < 1.25f ? ttA[i] : tA[i];
+        lessBranchAssign(tA, absAx, 1.25f, ttA, tA);
+        lessBranchAssign(tA, absAx, 0.84375f, xA2, tA);
+
+        // 开始实现最后的大block
+        __bang_write_zero(retA, BATCH_SZ);
+        // Au = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, rb6, rb5), rb4), rb3), rb2), rb1), rb0);
+        mad0(tA, rb6, rb5, tempA);
+        mad1(tA, tempA, rb4, tempA);
+        mad1(tA, tempA, rb3, tempA);
+        mad1(tA, tempA, rb2, tempA);
+        mad1(tA, tempA, rb1, tempA);
+        mad1(tA, tempA, rb0, Au);
+
+        // Av = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, sb7, sb6), sb5), sb4), sb3), sb2), sb1);
+        mad0(tA, sb7, sb6, tempA);
+        mad1(tA, tempA, sb5, tempA);
+        mad1(tA, tempA, sb4, tempA);
+        mad1(tA, tempA, sb3, tempA);
+        mad1(tA, tempA, sb2, tempA);
+        mad1(tA, tempA, sb1, Av);
+
+        // tAu = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, ra7, ra6), ra5), ra4), ra3), ra2), ra1), ra0);
+        mad0(tA, ra7, ra6, tempA);
+        mad1(tA, tempA, ra5, tempA);
+        mad1(tA, tempA, ra4, tempA);
+        mad1(tA, tempA, ra3, tempA);
+        mad1(tA, tempA, ra2, tempA);
+        mad1(tA, tempA, ra1, tempA);
+        mad1(tA, tempA, ra0, tAu);
+
+        // tAv[i] = mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, mad(tA, sa8, sa7), sa6), sa5), sa4), sa3), sa2), sa1);
+        mad0(tA, sa8, sa7, tempA);
+        mad1(tA, tempA, sa6, tempA);
+        mad1(tA, tempA, sa5, tempA);
+        mad1(tA, tempA, sa4, tempA);
+        mad1(tA, tempA, sa3, tempA);
+        mad1(tA, tempA, sa2, tempA);
+        mad1(tA, tempA, sa1, tAv);
+
+        // Au[i] = absAx[i] < 0x1.6db6dap+1f ? tAu[i] : Au[i];    // double
+        lessBranchAssign(Au, absAx, 0x1.6db6dap+1f, tAu, Au);
+
+        //     Av[i] = absAx[i] < 0x1.6db6dap+1f ? tAv[i] : Av[i];
+        lessBranchAssign(Av, absAx, 0x1.6db6dap+1f, tAv, Av);
+
+        // tAu[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], pa6, pa5), pa4), pa3), pa2), pa1), pa0);
+        mad0(tA, pa6, pa5, tempA);
+        mad1(tA, tempA, pa4, tempA);
+        mad1(tA, tempA, pa3, tempA);
+        mad1(tA, tempA, pa2, tempA);
+        mad1(tA, tempA, pa1, tempA);
+        mad1(tA, tempA, pa0, tAu);
+
+        // tAv[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], qa6, qa5), qa4), qa3), qa2), qa1);
+        mad0(tA, qa6, qa5, tempA);
+        mad1(tA, tempA, qa4, tempA);
+        mad1(tA, tempA, qa3, tempA);
+        mad1(tA, tempA, qa2, tempA);
+        mad1(tA, tempA, qa1, tAv);
+
+        //     Au[i] = absAx[i] < 0.84375f ? tAu[i] : Au[i];
+        lessBranchAssign(Au, absAx, 1.25f, tAu, Au);
+
+        //     Av[i] = absAx[i] < 0.84375f ? tAv[i] : Av[i];
+        lessBranchAssign(Av, absAx, 1.25f, tAv, Av);
+
+        // tAu[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], pp4, pp3), pp2), pp1), pp0);
+        mad0(tA, pp4, pp3, tempA);
+        mad1(tA, tempA, pp2, tempA);
+        mad1(tA, tempA, pp1, tempA);
+        mad1(tA, tempA, pp0, tAu);
+
+        // tAv[i] = mad(tA[i], mad(tA[i], mad(tA[i], mad(tA[i], qq5, qq4), qq3), qq2), qq1);
+
+        mad0(tA, qq5, qq4, tempA);
+        mad1(tA, tempA, qq3, tempA);
+        mad1(tA, tempA, qq2, tempA);
+        mad1(tA, tempA, qq1, tAv);
+        // Au[i] = absAx[i] < 0.84375f ? tAu[i] : Au[i];
+        lessBranchAssign(Au, absAx, 0.84375f, tAu, Au);
+        // Av[i] = absAx[i] < 0.84375f ? tAv[i] : Av[i];
+        lessBranchAssign(Av, absAx, 0.84375f, tAv, Av);
+
+        // Av[i] = mad(tA[i], Av[i], 1.0f);
+        mad1(tA, Av, 1.0f, Av);
+
+        // qA[i] = MATH_DIVIDE(Au[i],Av[i]);
+        MATH_DIVIDE1(Au, Av, qA);
+
+        // for (i = 0; i < BATCH_SZ; i++)
+        //   zA[i] = as_float(iAx[i] & 0xfffff000);
+        __bang_band_scalar(hAx, iAx, 0xfff0, BATCH_SZ);
+
+        __memcpy(zA, hAx, BATCH_SZ * sizeof(int16_t), NRAM2NRAM);
+
+        // rA[i] = exp(mad(-zA[i], zA[i], -0.5625f)) * exp(mad(zA[i] - absAx[i], zA[i] + absAx[i], qA[i]));
+        __bang_mul_scalar(tempA, zA, -1.0f, BATCH_SZ);
+        mad1(tempA, zA, -0.5625f, tempA);
+        __bang_active_exphp(tempA, tempA, BATCH_SZ);
+        __bang_sub(tempB, zA, absAx, BATCH_SZ);
+        __bang_add(tempC, zA, absAx, BATCH_SZ);
+        mad2(tempB, tempC, qA, tempD);
+        __bang_active_exphp(tempD, tempD, BATCH_SZ);
+        __bang_mul(rA, tempA, tempD, BATCH_SZ);
+
+        //     rA[i] =  MATH_DIVIDE(rA[i], absAx[i]);
+        MATH_DIVIDE1(rA, absAx, rA);
+
+        //     tA[i] = 2.0f - rA[i];
+        __bang_sub_scalar(tempA, rA, 2.0f, BATCH_SZ);
+        __bang_mul_scalar(tA, tempA, -1.0, BATCH_SZ);
+
+        // r = x < 0.0f ? t : r;
+        lessBranchAssign(rA, xA + step * BATCH_SZ, 0.0f, tA, rA);
+
+        //     retA[i] = absAx[i] < 28.0f ? rA[i] : retA[i];
+        lessBranchAssign(retA, absAx, 28.0f, rA, retA);
+
+        //     rA[i] = 1.0f - erx_f - qA[i];
+        tempScalar1 = 1.0f - erx_f;
+        __bang_sub_scalar(tempA, qA, tempScalar1, BATCH_SZ);
+        __bang_mul_scalar(rA, tempA, -1.0, BATCH_SZ);
+
+        //     tA[i] = erx_f + qA[i] + 1.0f;
+        tempScalar1 = 1.0f + erx_f;
+        __bang_add_scalar(tA, qA, tempScalar1, BATCH_SZ);
+
+        lessBranchAssign(rA, xA + step * BATCH_SZ, 0.00f, tA, rA);
+
+        //     retA[i] = absAx[i] < 1.25f ? rA[i] : retA[i];
+        lessBranchAssign(retA, absAx, 1.25f, rA, retA);
+
+        // rA[i] = 0.5f - mad(xA[i],qA[i],xA[i]-0.5f);
+        __bang_sub_scalar(tempA, xA + step * BATCH_SZ, 0.5f, BATCH_SZ);
+        mad2(xA + step * BATCH_SZ, qA, tempA, tempB);
+        __bang_sub_scalar(tempA, tempB, 0.5f, BATCH_SZ);
+        __bang_mul_scalar(rA, tempA, -1.0, BATCH_SZ);
+
+        //     retA[i] = absAx[i] < 0.84375f ? rA[i] : retA[i];
+        lessBranchAssign(retA, absAx, 0.84375f, rA, retA);
+
+        //     retA[i] = xA[i] < -6.0f ? 2.0f : retA[i];
+        // setVecValue(tempA,2.0f);
+        setVecValue(tempA, 2.0f);
+        lessBranchAssign(retA, xA + step * BATCH_SZ, -6.0f, tempA, retA);
+
+        __bang_move(xA + step * BATCH_SZ, retA, sizeof(T) * BATCH_SZ);
+    }
+}
+
+
+
+// 设备侧代码
+template <typename T>
+__mlu_entry__ void kernel_erfc(T *src, T *dest, unsigned int N, int validTaskNum)
+{
+    // if (taskId == 0)
+    //     __bang_printf("typesize: %d\n", sizeof(T));
+    if ((taskId + 1 ) > validTaskNum)
+        return;
+
+    // float or half
+    bool flag = true;
+    if(sizeof(T) == sizeof(half)) flag = false;
+
+    // __bang_printf("taskId: %d \n",taskId);
+    if (validTaskNum > N / WORKLOAD && taskId == validTaskNum - 1) // 如果 N % BATCHSIZE!=0 , 现在最后一个mlu-core处理剩下的不足BATCH_SIZE个数据
+    {
+        __nram__ int workload;
+        workload = (N - taskId * WORKLOAD);
+
+        __nram__ T A[WORKLOAD];
+
+        __memcpy(A, src + taskId * WORKLOAD, workload * sizeof(T), GDRAM2NRAM);
+
+        if(flag) llvm_erfc(A);
+        else llvm_erfc_half(A);
+
+        __memcpy(dest + taskId * WORKLOAD, A, workload * sizeof(T), NRAM2GDRAM);
+    }
+    else
+    {
+        // __bang_printf("taskId: %d\n",taskId);
+        // if(taskId == validTaskNum-1) {
+        //     __bang_printf("offset: %d\n",taskId * WORKLOAD);
+        //     __bang_printf("WORKLOAD * sizeof(T): %d\n",WORKLOAD * sizeof(T));
+        // }
+        __nram__ T A[WORKLOAD];
+        // if(taskId == 0) __bang_printf("sizeof(T): %d \n",sizeof(T));
+        __memcpy(A, src + taskId * WORKLOAD, WORKLOAD * sizeof(T), GDRAM2NRAM);
+
+        if(flag) llvm_erfc(A);
+        else llvm_erfc_half(A);
+
+        __memcpy(dest + taskId * WORKLOAD, A, WORKLOAD * sizeof(T), NRAM2GDRAM);
+    }
+}
+
+mluOpStatus_t MLUOP_WIN_API
+Kernel3StagePipelineErfc(const cnrtDim3_t k_dim, const cnrtFunctionType_t k_type,
+                         const cnrtQueue_t queue, const mluOpDataType_t d_type,
+                         const void *x, void *y, const unsigned int N)
+{
+    // 有效工作的 MLU_CORE
+    int validTaskNum = N % WORKLOAD == 0 ? N / WORKLOAD : N / WORKLOAD + 1;
+    // printf("validTaskNum: %d\n",validTaskNum);
+    if (d_type == MLUOP_DTYPE_FLOAT)
+    {
+        kernel_erfc<<<k_dim, k_type, queue>>>((float *)x, (float *)y, N, validTaskNum);
+    }
+    else
+    {
+        kernel_erfc<<<k_dim, k_type, queue>>>((half *)x, (half *)y, N, validTaskNum);
+    }
+
+    return MLUOP_STATUS_SUCCESS;
+}
