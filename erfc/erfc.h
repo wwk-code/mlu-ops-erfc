@@ -27,7 +27,7 @@
 #include "../../mlu_op.h"
 
 #define WORKLOAD 4096
-#define BATCH_SZ 4096
+#define BATCH_SZ 1024
 
 
 mluOpStatus_t MLUOP_WIN_API
